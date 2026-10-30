@@ -1,0 +1,124 @@
+name: Build APK from ZIP
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          shopt -s nullglob
+          zips=( *.zip )
+
+          if [ "${#zips[@]}" -eq 0 ]; then
+            echo "::error::No ZIP file found in repository root."
+            exit 1
+          fi
+
+          ZIP="${zips[0]}"
+          echo "Using ZIP: $ZIP"
+
+          mkdir -p "$RUNNER_TEMP/reels-project"
+          unzip -q -o "$ZIP" -d "$RUNNER_TEMP/reels-project"
+
+          echo "Extracted files:"
+          find "$RUNNER_TEMP/reels-project" -maxdepth 4 -type f | head -100
+
+      - name: Locate Android project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ROOT="$RUNNER_TEMP/reels-project"
+
+          mapfile -t SETTINGS < <(
+            find "$ROOT" -type f \
+              \( -name settings.gradle -o -name settings.gradle.kts \) \
+              -not -path '*/__MACOSX/*'
+          )
+
+          if [ "${#SETTINGS[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one settings.gradle or settings.gradle.kts."
+            find "$ROOT" -maxdepth 5 -type f | head -100
+            exit 1
+          fi
+
+          PROJECT_DIR="$(dirname "${SETTINGS[0]}")"
+
+          if [ ! -d "$PROJECT_DIR/app" ]; then
+            echo "::error::Android app module not found."
+            exit 1
+          fi
+
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Android project: $PROJECT_DIR"
+
+          ls -la "$PROJECT_DIR"
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Build release APK
+        shell: bash
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -euo pipefail
+
+          if [ -f ./gradlew ]; then
+            echo "Using project Gradle Wrapper."
+            chmod +x ./gradlew
+            ./gradlew :app:assembleRelease --no-daemon --stacktrace
+          else
+            echo "Gradle Wrapper not found. Using Gradle 8.7."
+            gradle --version
+            gradle :app:assembleRelease --no-daemon --stacktrace
+          fi
+
+      - name: Verify APK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APK_DIR="$PROJECT_DIR/app/build/outputs/apk/release"
+
+          if [ ! -d "$APK_DIR" ]; then
+            echo "::error::Release APK directory not found."
+            exit 1
+          fi
+
+          if ! find "$APK_DIR" -name "*.apk" -type f | grep -q .; then
+            echo "::error::No APK was generated."
+            exit 1
+          fi
+
+          find "$APK_DIR" -name "*.apk" -type f
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: reels-apk
+          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
